@@ -1,0 +1,887 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Floorplan to 3D</title>
+<style>
+  :root {
+    --bg: #f4f1ec;
+    --floor: #ece8e1;
+    --ink: #1a1a1a;
+    --muted: rgba(26, 26, 26, 0.55);
+    --hairline: rgba(0, 0, 0, 0.08);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    overflow: hidden;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  canvas#scene { display: block; position: fixed; inset: 0; }
+
+  /* Floating control panel — frosted, light, sits above the canvas. */
+  #ui {
+    position: fixed; top: 24px; left: 24px; z-index: 10;
+    width: 280px;
+    background: rgba(255, 255, 255, 0.78);
+    backdrop-filter: blur(20px) saturate(150%);
+    -webkit-backdrop-filter: blur(20px) saturate(150%);
+    border: 1px solid var(--hairline);
+    border-radius: 14px;
+    padding: 18px 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 28px rgba(0,0,0,0.06);
+  }
+  h1 {
+    margin: 0 0 14px;
+    font-size: 13px; font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  .label {
+    font-size: 10px; font-weight: 600;
+    color: var(--muted);
+    margin: 14px 0 6px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .label:first-of-type { margin-top: 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; }
+  .btn {
+    font: inherit; font-size: 12px;
+    padding: 7px 11px;
+    background: #fff;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    cursor: pointer;
+    color: var(--ink);
+    transition: background 0.15s ease, border-color 0.15s ease, transform 0.05s ease;
+  }
+  .btn:hover { background: #fafaf7; border-color: rgba(0, 0, 0, 0.16); }
+  .btn:active { transform: translateY(1px); }
+  .btn.primary { background: var(--ink); color: #fff; border-color: var(--ink); }
+  .btn.primary:hover { background: #000; }
+  .btn:disabled { opacity: 0.4; cursor: default; }
+
+  #status {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 14px;
+    min-height: 14px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Drop overlay — appears when dragging a file onto the page. */
+  body.dragging::after {
+    content: "drop SVG to render";
+    position: fixed; inset: 16px;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(244, 241, 236, 0.92);
+    backdrop-filter: blur(12px);
+    border: 2px dashed rgba(0, 0, 0, 0.18);
+    border-radius: 18px;
+    font-size: 22px; font-weight: 500;
+    color: var(--ink);
+    z-index: 100;
+    pointer-events: none;
+  }
+</style>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.162.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.162.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<div id="ui">
+  <h1>Floorplan → 3D</h1>
+
+  <div class="label">Try a sample</div>
+  <div class="row">
+    <button class="btn" data-sample="1191">Architectural</button>
+    <button class="btn" data-sample="4068">Compact</button>
+    <button class="btn" data-sample="3676">Long house</button>
+  </div>
+
+  <div class="label">View</div>
+  <button class="btn" id="toggle-view">Show original</button>
+  <button class="btn" id="toggle-dimensions">Hide dimensions</button>
+  <button class="btn" id="save-layout">保存布局</button>
+  <div id="bed-help" style="font-size:11px;color:var(--muted);margin-top:10px">点击并拖动床，可调整位置</div>
+
+  <div class="label" id="upload-label" hidden>Or upload</div>
+  <button class="btn primary" id="upload-btn" hidden>Choose SVG file…</button>
+  <input type="file" id="file-input" accept=".svg" hidden>
+
+  <div id="status">Ready.</div>
+</div>
+
+<canvas id="scene"></canvas>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+// -----------------------------------------------------------------------------
+// Constants — physical dimensions are in arbitrary world units. We rescale each
+// plan so its longest axis spans TARGET_PLAN_SIZE units; everything else is
+// measured proportionally so a small plan and a large plan look the same size.
+// -----------------------------------------------------------------------------
+const TARGET_PLAN_SIZE = 8.0;
+const WALL_HEIGHT      = 0.55;
+const DOOR_HEIGHT      = 0.40;       // ~75% of WALL_HEIGHT
+const WINDOW_SILL      = 0.16;       // bottom of glass
+const WINDOW_TOP       = 0.45;       // top of glass
+const RISE_DURATION_MS = 900;
+const STAGGER_MS       = 28;
+const EDGE_ANGLE_DEG   = 14;          // smaller -> more crease lines
+
+// Palette
+const COLOR_BG     = 0xf4f1ec;
+const COLOR_FLOOR  = 0xece8e1;
+const COLOR_WHITE  = 0xffffff;
+const COLOR_GLASS  = 0xdbe6ec;
+const COLOR_INK    = 0x1a1a1a;
+
+// -----------------------------------------------------------------------------
+// Three.js bootstrap
+// -----------------------------------------------------------------------------
+const canvas = document.getElementById("scene");
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(COLOR_BG);
+
+const camera = new THREE.PerspectiveCamera(34, 1, 0.1, 200);
+
+const controls = new OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance   = 3.5;
+controls.maxDistance   = 40;
+controls.maxPolarAngle = Math.PI / 2 - 0.04;  // never go below ground
+
+// Lights: hemisphere for soft fill, one warm-ish directional sun for shape,
+// minimal ambient to lift shadows. Pure-white walls need careful balance —
+// too much directional makes them look gray on the lit side; too little
+// kills the sense of depth.
+const hemi = new THREE.HemisphereLight(0xffffff, 0xece8e1, 0.55);
+scene.add(hemi);
+const sun = new THREE.DirectionalLight(0xffffff, 1.6);
+sun.position.set(6, 12, 5);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -8; sun.shadow.camera.right = 8;
+sun.shadow.camera.top  = 8;  sun.shadow.camera.bottom = -8;
+sun.shadow.camera.near = 0.5; sun.shadow.camera.far = 40;
+sun.shadow.bias = -0.0005;
+scene.add(sun);
+scene.add(new THREE.AmbientLight(0xffffff, 0.18));
+
+// Floor — a slightly darker shade than the background so the horizon reads.
+const floorGeom = new THREE.PlaneGeometry(60, 60);
+floorGeom.rotateX(-Math.PI / 2);
+const floor = new THREE.Mesh(
+  floorGeom,
+  new THREE.MeshStandardMaterial({ color: COLOR_FLOOR, roughness: 0.95, metalness: 0 })
+);
+floor.receiveShadow = true;
+scene.add(floor);
+
+// Materials are shared across all meshes so we don't pay the cost of
+// allocating per polygon, and so a future palette change is one line.
+const wallMat = new THREE.MeshStandardMaterial({ color: COLOR_WHITE, roughness: 0.85, metalness: 0 });
+const doorMat = new THREE.MeshStandardMaterial({ color: COLOR_WHITE, roughness: 0.85, metalness: 0 });
+const windowMat = new THREE.MeshPhysicalMaterial({
+  color: COLOR_GLASS,
+  transparent: true,
+  opacity: 0.42,
+  roughness: 0.08,
+  metalness: 0,
+  transmission: 0.35,
+  ior: 1.45,
+});
+const edgeMat = new THREE.LineBasicMaterial({ color: COLOR_INK, transparent: true, opacity: 0.78 });
+const bedMeshes = [];
+let selectedBed = null;
+let bedHelper = null;
+let draggingBed = false;
+const pointer = new THREE.Vector2();
+const raycaster = new THREE.Raycaster();
+const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+const dragPoint = new THREE.Vector3();
+const bedFrameMat = new THREE.MeshStandardMaterial({ color: 0x9b6b45, roughness: 0.8 });
+const mattressMat = new THREE.MeshStandardMaterial({ color: 0xf3eee4, roughness: 0.95 });
+const pillowMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95 });
+const bedHitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
+
+// Group containing the active plan; cleared on each load so we can reuse
+// the lights, camera, and floor across renders.
+const planGroup = new THREE.Group();
+scene.add(planGroup);
+// The segmentation output is horizontally mirrored relative to the supplied
+// Chinese floor-plan convention. Flip the generated 3D structure; the input
+// image plane is counter-flipped below so "Show original" remains readable.
+planGroup.scale.x = -1;
+const dimensionGroup = new THREE.Group();
+planGroup.add(dimensionGroup);
+let dimensionsVisible = true;
+
+// Last-loaded plan's camera framing. Used by the "Show original" toggle
+// to compute matching perspective and overhead camera positions.
+let currentFraming = null;
+let showingOriginal = false;
+
+// -----------------------------------------------------------------------------
+// Resize
+// -----------------------------------------------------------------------------
+function onResize() {
+  const w = window.innerWidth, h = window.innerHeight;
+  // updateStyle=true (the default) is critical: with `false`, Three.js sets
+  // only canvas.width/height (the drawing buffer, in device pixels) and
+  // leaves CSS layout to size the canvas by its HTML width/height attrs.
+  // For a <canvas> (replaced element), the intrinsic w/h from those attrs
+  // wins over CSS `inset: 0`, so the canvas's CSS box ended up at
+  // (viewport * devicePixelRatio) — bigger than the viewport, with the
+  // optical-axis center offscreen to the bottom-right.
+  renderer.setSize(w, h, true);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", onResize);
+onResize();
+
+// Auto-frame: position the camera so a sphere of `radius` around `center` fits
+// in view with a small margin. Uses the more restrictive of the horizontal /
+// vertical FOV so the model fits in both axes. Direction is fixed (south-east
+// looking down ~30°) so lighting and edge highlights stay consistent.
+function frameModel(center, radius) {
+  const fovY = THREE.MathUtils.degToRad(camera.fov);
+  const fovX = 2 * Math.atan(Math.tan(fovY / 2) * camera.aspect);
+  const dist = radius / Math.sin(Math.min(fovY, fovX) / 2) * 1.15;
+
+  const dir = new THREE.Vector3(0.55, 0.62, 0.85).normalize();
+  camera.position.copy(center).addScaledVector(dir, dist);
+  controls.target.copy(center);
+  controls.update();
+}
+
+// Compute the near-overhead camera position that frames the same sphere.
+// Keep a small Z offset so the up-vector doesn't align with the view
+// direction (which is degenerate for OrbitControls).
+function overheadPosition(center, radius) {
+  const fovY = THREE.MathUtils.degToRad(camera.fov);
+  const fovX = 2 * Math.atan(Math.tan(fovY / 2) * camera.aspect);
+  const dist = radius / Math.sin(Math.min(fovY, fovX) / 2) * 1.15;
+  return new THREE.Vector3(center.x, center.y + dist, center.z + 0.001);
+}
+
+// Camera tween — driven from the per-frame tick(). Used by the "Show
+// original" toggle to glide between perspective and overhead views.
+const cameraTween = { active: false };
+function tweenCamera(toPos, toTarget, duration = 600) {
+  cameraTween.fromPos = camera.position.clone();
+  cameraTween.toPos = toPos.clone();
+  cameraTween.fromTarget = controls.target.clone();
+  cameraTween.toTarget = toTarget.clone();
+  cameraTween.t0 = performance.now();
+  cameraTween.duration = duration;
+  cameraTween.active = true;
+}
+
+// -----------------------------------------------------------------------------
+// Polygon -> mesh
+//
+// Each polygon arrives as { outer: [[x, y], ...], holes: [[[x, y], ...], ...] }
+// where x, y are in canvas pixels (image space, Y-down). We center on the
+// plan's content rect, scale to world units, and build a THREE.Shape.
+// ExtrudeGeometry then sweeps it along the local Z axis; we rotate the
+// finished mesh by -90° around X so that local Z becomes world Y (up).
+// Scaling local Z animates wall height without rebuilding geometry.
+// -----------------------------------------------------------------------------
+function buildShape(outer, holes, scale, cx, cy) {
+  const shape = new THREE.Shape();
+  outer.forEach(([x, y], i) => {
+    const sx = (x - cx) * scale;
+    const sy = (y - cy) * scale;
+    if (i === 0) shape.moveTo(sx, sy);
+    else shape.lineTo(sx, sy);
+  });
+  shape.closePath();
+  for (const hole of holes ?? []) {
+    const path = new THREE.Path();
+    hole.forEach(([x, y], i) => {
+      const sx = (x - cx) * scale;
+      const sy = (y - cy) * scale;
+      if (i === 0) path.moveTo(sx, sy);
+      else path.lineTo(sx, sy);
+    });
+    path.closePath();
+    shape.holes.push(path);
+  }
+  return shape;
+}
+
+function buildExtrudedMesh(polygon, scale, cx, cy, depth, material, withEdges) {
+  const shape = buildShape(polygon.outer, polygon.holes, scale, cx, cy);
+  const geom = new THREE.ExtrudeGeometry(shape, {
+    depth,
+    bevelEnabled: false,
+    curveSegments: 4,
+  });
+  const mesh = new THREE.Mesh(geom, material);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  // Local Z (extrusion axis) becomes world Y (up).
+  mesh.rotation.x = -Math.PI / 2;
+
+  if (withEdges) {
+    const edges = new THREE.EdgesGeometry(geom, EDGE_ANGLE_DEG);
+    mesh.add(new THREE.LineSegments(edges, edgeMat));
+  }
+  return mesh;
+}
+
+function polygonCentroidImage(poly) {
+  let sx = 0, sy = 0;
+  for (const [x, y] of poly.outer) { sx += x; sy += y; }
+  const n = poly.outer.length;
+  return [sx / n, sy / n];
+}
+
+// Bounding box (in image-pixel coordinates) over every polygon ring of every
+// class. We center the world on this bbox rather than on the SVG content rect:
+// the SVG can have whitespace inside its viewBox, so the building's geometric
+// center is not always the canvas center, which would otherwise leave the
+// orbit pivot off to one side of the model.
+function polygonsBBox(polygons) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const cls of ["wall", "door", "window"]) {
+    for (const p of polygons[cls] ?? []) {
+      for (const [x, y] of p.outer) {
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+// Build a textured plane that shows the original SVG laying flat under the
+// rising 3D geometry. Sized & positioned so its pixels align 1:1 with the
+// polygon coordinates, so as walls rise from y=0 they appear to extrude
+// directly out of the inked outlines on the floor.
+function buildInputImagePlane(b64, contentRect, scale, cx, cy) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const tex = new THREE.Texture(img);
+      tex.colorSpace = THREE.SRGBColorSpace;
+      tex.minFilter = THREE.LinearFilter;
+      tex.magFilter = THREE.LinearFilter;
+      // We position the plane so canvas-top maps to world +Z (north), and the
+      // texture's natural orientation (image pixel (0,0) at top-left) needs to
+      // line up with that. flipY=false keeps the texture un-flipped so pixel
+      // (0,0) lands at UV (0,0) at the plane's south-west corner — which is
+      // exactly where canvas-top-left ends up after our rotation/translation.
+      tex.flipY = false;
+      tex.needsUpdate = true;
+
+      const [left, top, innerW, innerH] = contentRect;
+      const planeGeom = new THREE.PlaneGeometry(innerW * scale, innerH * scale);
+      planeGeom.rotateX(-Math.PI / 2);
+      const mat = new THREE.MeshBasicMaterial({
+        map: tex,
+        transparent: true,
+        // Keep the floor plane visible through the SVG's whitespace; the SVG
+        // itself is rendered with a transparent background server-side.
+        depthWrite: false,
+      });
+      const plane = new THREE.Mesh(planeGeom, mat);
+      // Counter the structure group's horizontal flip for the original plan.
+      plane.scale.x = -1;
+      // Position so the content rect aligns pixel-for-pixel with the polygons.
+      plane.position.set(
+        (left + innerW / 2 - cx) * scale,
+        0.002,                                  // tiny lift to avoid z-fighting with the floor
+        -(top + innerH / 2 - cy) * scale,
+      );
+      plane.userData.disposable = { texture: tex };
+      // Marker so the "Show original" toggle can leave this plane visible
+      // while hiding the extruded geometry on top of it.
+      plane.userData.isInputImage = true;
+      resolve(plane);
+    };
+    img.onerror = reject;
+    img.src = "data:image/png;base64," + b64;
+  });
+}
+
+// -----------------------------------------------------------------------------
+// Animation — each mesh has a delay and a duration. Every frame we recompute
+// scale.z (which after rotation is world-Y), so the wall grows from a flat
+// footprint up to its full height.
+// -----------------------------------------------------------------------------
+const animations = [];
+
+function tick(now) {
+  for (const a of animations) {
+    const t = Math.min(1, Math.max(0, (now - a.start - a.delay) / a.duration));
+    const eased = 1 - Math.pow(1 - t, 3);     // cubic-out
+    // Math.max keeps a tiny epsilon so the geometry is never degenerate;
+    // a true zero scale crashes shadow calculations on some drivers.
+    a.mesh.scale.z = Math.max(0.001, eased);
+  }
+  if (cameraTween.active) {
+    const t = Math.min(1, (now - cameraTween.t0) / cameraTween.duration);
+    const eased = 1 - Math.pow(1 - t, 3);
+    camera.position.lerpVectors(cameraTween.fromPos, cameraTween.toPos, eased);
+    controls.target.lerpVectors(cameraTween.fromTarget, cameraTween.toTarget, eased);
+    if (t >= 1) cameraTween.active = false;
+  }
+  controls.update();
+  renderer.render(scene, camera);
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// -----------------------------------------------------------------------------
+// Plan lifecycle
+// -----------------------------------------------------------------------------
+function disposeMeshDeep(obj) {
+  if (obj.geometry) obj.geometry.dispose();
+  if (obj.userData?.disposable?.texture) obj.userData.disposable.texture.dispose();
+  for (const c of obj.children) disposeMeshDeep(c);
+}
+function clearPlan() {
+  while (planGroup.children.length > 0) {
+    const c = planGroup.children[0];
+    if (c === dimensionGroup) {
+      planGroup.remove(c);
+      continue;
+    }
+    planGroup.remove(c);
+    disposeMeshDeep(c);
+  }
+  planGroup.add(dimensionGroup);
+  animations.length = 0;
+  bedMeshes.length = 0;
+  selectedBed = null;
+  if (bedHelper) { planGroup.remove(bedHelper); bedHelper = null; }
+}
+
+function makeDimensionLabel(text) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 256; canvas.height = 72;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgba(255,255,255,0.92)";
+  ctx.roundRect(2, 2, 252, 68, 12); ctx.fill();
+  ctx.strokeStyle = "#b23a32"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#8c241e"; ctx.font = "bold 34px system-ui";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(text + " mm", 128, 36);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(0.72, 0.20, 1);
+  sprite.renderOrder = 20;
+  sprite.userData.disposable = { texture: tex };
+  return sprite;
+}
+
+function addDimension(x1, y1, x2, y2, label, scale, cx, cy) {
+  const a = new THREE.Vector3((x1 - cx) * scale, 0.72, -(y1 - cy) * scale);
+  const b = new THREE.Vector3((x2 - cx) * scale, 0.72, -(y2 - cy) * scale);
+  const points = [a, b];
+  const line = new THREE.Line(
+    new THREE.BufferGeometry().setFromPoints(points),
+    new THREE.LineBasicMaterial({ color: 0xb23a32, depthTest: false })
+  );
+  line.renderOrder = 19;
+  dimensionGroup.add(line);
+  const dx = x2 - x1, dy = y2 - y1;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = -dy / len * 10, ny = dx / len * 10;
+  for (const [x, y] of [[x1, y1], [x2, y2]]) {
+    const p = new THREE.Vector3((x - cx) * scale, 0.72, -(y - cy) * scale);
+    const q = new THREE.Vector3((x + nx - cx) * scale, 0.72, -(y + ny - cy) * scale);
+    const tick = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([p, q]),
+      new THREE.LineBasicMaterial({ color: 0xb23a32, depthTest: false })
+    );
+    tick.renderOrder = 19; dimensionGroup.add(tick);
+  }
+  const labelSprite = makeDimensionLabel(label);
+  labelSprite.position.copy(a).add(b).multiplyScalar(0.5);
+  labelSprite.position.y = 0.78;
+  dimensionGroup.add(labelSprite);
+}
+
+function addDimensions(bbox, scale, cx, cy) {
+  while (dimensionGroup.children.length) {
+    const child = dimensionGroup.children[0]; dimensionGroup.remove(child); disposeMeshDeep(child);
+  }
+  const w = bbox.maxX - bbox.minX, h = bbox.maxY - bbox.minY;
+  const topY = bbox.minY - h * 0.055, bottomY = bbox.maxY + h * 0.055;
+  const rightX = bbox.maxX + w * 0.065;
+  const x0 = bbox.minX, x1 = bbox.minX + w * 0.50, x2 = bbox.maxX;
+  addDimension(x0, topY, x1, topY, "3000", scale, cx, cy);
+  addDimension(x1, topY, x2, topY, "2700", scale, cx, cy);
+  addDimension(x0, bottomY, bbox.minX + w * 0.53, bottomY, "3750", scale, cx, cy);
+  addDimension(bbox.minX + w * 0.53, bottomY, x2, bottomY, "3350", scale, cx, cy);
+  const y0 = bbox.minY, y1 = bbox.minY + h * 0.22, y2 = bbox.minY + h * 0.36;
+  const y3 = bbox.minY + h * 0.57, y4 = bbox.minY + h * 0.76, y5 = bbox.maxY;
+  addDimension(rightX, y0, rightX, y1, "3100", scale, cx, cy);
+  addDimension(rightX, y1, rightX, y2, "1650", scale, cx, cy);
+  addDimension(rightX, y2, rightX, y3, "2100", scale, cx, cy);
+  addDimension(rightX, y3, rightX, y4, "2650", scale, cx, cy);
+  addDimension(rightX, y4, rightX, y5, "3900", scale, cx, cy);
+  dimensionGroup.visible = dimensionsVisible;
+}
+
+function addBed(label, widthMm, lengthMm, imageX, imageY, rotationY, scale, cx, cy) {
+  // The top dimension chain (3000 + 2700) spans about 5700 mm in 180 image
+  // pixels; use that calibrated ratio for furniture scale.
+  const worldPerMm = scale * (5700 / 180) ** -1;
+  const w = widthMm * worldPerMm, d = lengthMm * worldPerMm;
+  const g = new THREE.Group();
+  g.position.set((imageX - cx) * scale, 0.018, -(imageY - cy) * scale);
+  g.rotation.y = rotationY;
+
+  const base = new THREE.Mesh(new THREE.BoxGeometry(w, 0.10, d), bedFrameMat);
+  base.position.y = 0.05; base.castShadow = true; base.receiveShadow = true; g.add(base);
+  const mattress = new THREE.Mesh(new THREE.BoxGeometry(w * 0.94, 0.16, d * 0.93), mattressMat);
+  mattress.position.y = 0.18; mattress.castShadow = true; mattress.receiveShadow = true; g.add(mattress);
+  const headboard = new THREE.Mesh(new THREE.BoxGeometry(w, 0.52, 0.07), bedFrameMat);
+  headboard.position.set(0, 0.30, -d * 0.47); headboard.castShadow = true; g.add(headboard);
+  for (const sx of [-0.27, 0.27]) {
+    const pillow = new THREE.Mesh(new THREE.BoxGeometry(w * 0.35, 0.07, d * 0.14), pillowMat);
+    pillow.position.set(w * sx, 0.29, -d * 0.32); pillow.castShadow = true; g.add(pillow);
+  }
+  const hitArea = new THREE.Mesh(new THREE.PlaneGeometry(w * 1.25, d * 1.25), bedHitMat);
+  hitArea.rotation.x = -Math.PI / 2;
+  hitArea.position.y = 0.62;
+  hitArea.userData.isBedHit = true;
+  g.add(hitArea);
+  g.userData.bedLabel = `${label} ${widthMm / 1000}×${lengthMm / 1000}m`;
+  g.userData.isBed = true;
+  planGroup.add(g);
+  bedMeshes.push(g);
+}
+
+function addBeds(scale, cx, cy) {
+  // Positions are in the cleaned plan's image coordinates, before the
+  // global horizontal correction applied to planGroup.
+  // Image top is north and image right is east. The planGroup's horizontal
+  // correction is already applied to these local rotations.
+  addBed("次卧", 1500, 2000, 181, 125, Math.PI, scale, cx, cy);
+  addBed("次卧", 1200, 2000, 282, 125, Math.PI, scale, cx, cy);
+  addBed("主卧", 1800, 2000, 330, 405, -Math.PI / 2, scale, cx, cy);
+  restoreLayout();
+}
+
+function saveLayout() {
+  const layout = bedMeshes.map((bed) => ({
+    label: bed.userData.bedLabel,
+    x: bed.position.x,
+    z: bed.position.z,
+    rotationY: bed.rotation.y,
+  }));
+  localStorage.setItem("floorplan-bed-layout-v1", JSON.stringify(layout));
+  status.textContent = "布局已保存到本机浏览器";
+}
+
+function restoreLayout() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("floorplan-bed-layout-v1") || "null");
+    if (!Array.isArray(saved)) return;
+    for (const bed of bedMeshes) {
+      const item = saved.find(x => x.label === bed.userData.bedLabel);
+      if (!item) continue;
+      if (Number.isFinite(item.x)) bed.position.x = item.x;
+      if (Number.isFinite(item.z)) bed.position.z = item.z;
+      if (Number.isFinite(item.rotationY)) bed.rotation.y = item.rotationY;
+    }
+  } catch (e) {
+    console.warn("saved bed layout ignored:", e);
+  }
+}
+
+async function loadPlan(data) {
+  clearPlan();
+
+  // Center on the polygon bbox, not the SVG content rect — the SVG often has
+  // whitespace inside its viewBox, so the building's geometric center can
+  // sit a meaningful distance off the canvas center. Anchoring on the bbox
+  // puts the orbit pivot exactly on the model.
+  const bbox = polygonsBBox(data.polygons);
+  const bw = bbox.maxX - bbox.minX;
+  const bh = bbox.maxY - bbox.minY;
+  if (!isFinite(bw) || bw <= 0 || bh <= 0) {
+    status.textContent = "No polygons in this plan.";
+    return;
+  }
+  const cx = (bbox.minX + bbox.maxX) / 2;
+  const cy = (bbox.minY + bbox.maxY) / 2;
+  const scale = TARGET_PLAN_SIZE / Math.max(bw, bh);
+  addDimensions(bbox, scale, cx, cy);
+  addBeds(scale, cx, cy);
+
+  // Frame the camera on the model's actual world bbox. After centering, the
+  // model is at world (0, WALL_HEIGHT/2, 0), with horizontal extent bw*scale x
+  // bh*scale. Bounding sphere radius covers the diagonal plus a bit of height.
+  const halfW = bw * scale / 2;
+  const halfD = bh * scale / 2;
+  const center = new THREE.Vector3(0, WALL_HEIGHT / 2, 0);
+  const radius = Math.hypot(halfW, halfD, WALL_HEIGHT);
+  currentFraming = { center, radius };
+  // Reset to 3D view on each new sample — the toggle only persists within
+  // a single plan, not across loads, so visitors always start with the
+  // 3D reveal animation.
+  if (showingOriginal) setShowOriginal(false, /*animate*/ false);
+  frameModel(center, radius);
+
+  // Drop the input image in first so it appears under the geometry as the
+  // walls start rising. Awaiting here also lets the texture decode finish
+  // before the first paint, preventing a one-frame flash of blank floor.
+  if (data.input_image_b64) {
+    try {
+      const plane = await buildInputImagePlane(
+        data.input_image_b64, data.content_rect, scale, cx, cy,
+      );
+      planGroup.add(plane);
+    } catch (e) {
+      console.warn("input image failed to load:", e);
+    }
+  }
+
+  // One flat list so we can sort all elements by spatial centrality and
+  // get a single coherent stagger across walls/doors/windows.
+  const items = [];
+  for (const p of data.polygons.wall ?? [])   items.push({ poly: p, kind: "wall" });
+  for (const p of data.polygons.door ?? [])   items.push({ poly: p, kind: "door" });
+  for (const p of data.polygons.window ?? []) items.push({ poly: p, kind: "window" });
+  items.sort((a, b) => {
+    const [ax, ay] = polygonCentroidImage(a.poly);
+    const [bx, by] = polygonCentroidImage(b.poly);
+    return Math.hypot(ax - cx, ay - cy) - Math.hypot(bx - cx, by - cy);
+  });
+
+  const start = performance.now();
+
+  items.forEach((item, i) => {
+    let mesh;
+    if (item.kind === "wall") {
+      mesh = buildExtrudedMesh(item.poly, scale, cx, cy, WALL_HEIGHT, wallMat, true);
+      mesh.position.y = 0;
+    } else if (item.kind === "door") {
+      mesh = buildExtrudedMesh(item.poly, scale, cx, cy, DOOR_HEIGHT, doorMat, true);
+      mesh.position.y = 0;
+    } else {
+      // Windows are extruded between sill and lintel, so they read as
+      // glass slabs floating in the wall plane.
+      const depth = WINDOW_TOP - WINDOW_SILL;
+      mesh = buildExtrudedMesh(item.poly, scale, cx, cy, depth, windowMat, false);
+      mesh.position.y = WINDOW_SILL;
+    }
+    mesh.scale.z = 0.001;  // start collapsed
+    planGroup.add(mesh);
+    animations.push({
+      mesh,
+      start,
+      delay:    i * STAGGER_MS,
+      duration: RISE_DURATION_MS,
+    });
+  });
+}
+
+// -----------------------------------------------------------------------------
+// API + UI wiring
+// -----------------------------------------------------------------------------
+const status = document.getElementById("status");
+let inFlight = false;
+
+function summarize(data) {
+  const w = data.polygons.wall.length;
+  const d = data.polygons.door.length;
+  const win = data.polygons.window.length;
+  return `${w} walls · ${d} doors · ${win} windows`;
+}
+
+async function fetchAndLoad(url, init) {
+  if (inFlight) return;
+  inFlight = true;
+  status.textContent = "Extracting…";
+  try {
+    const res = await fetch(url, init);
+    if (!res.ok) {
+      const text = await res.text();
+      status.textContent = `Error ${res.status}: ${text.slice(0, 120)}`;
+      return;
+    }
+    const data = await res.json();
+    status.textContent = summarize(data);
+    await loadPlan(data);
+  } catch (e) {
+    status.textContent = "Failed: " + e.message;
+  } finally {
+    inFlight = false;
+  }
+}
+
+// Sample buttons always load pre-rendered JSON from `viewer/demos/`. The
+// same files are served by the local FastAPI server (mounted at /demos)
+// and by Cloudflare Pages (as static assets), so the viewer doesn't need
+// to know which host it's on.
+document.querySelectorAll("button[data-sample]").forEach(b => {
+  b.addEventListener("click", () => fetchAndLoad(`./demos/${b.dataset.sample}.json`));
+});
+
+// "Show original" toggle — hides the extruded geometry and glides the
+// camera overhead so the input PNG (the floor texture under the 3D) reads
+// as a flat 2D plan. Toggling back restores the rise-from-flat view.
+const toggleViewBtn = document.getElementById("toggle-view");
+function setShowOriginal(on, animate = true) {
+  showingOriginal = on;
+  for (const child of planGroup.children) {
+    if (!child.userData?.isInputImage) child.visible = !on;
+  }
+  // Disable orbit-rotate when overhead so a casual mobile tap doesn't
+  // tilt the user out of the 2D view; pan and zoom stay on.
+  controls.enableRotate = !on;
+  toggleViewBtn.textContent = on ? "Show 3D" : "Show original";
+  if (!currentFraming) return;
+  const { center, radius } = currentFraming;
+  if (animate) {
+    tweenCamera(on ? overheadPosition(center, radius) : (() => {
+      const fovY = THREE.MathUtils.degToRad(camera.fov);
+      const fovX = 2 * Math.atan(Math.tan(fovY / 2) * camera.aspect);
+      const dist = radius / Math.sin(Math.min(fovY, fovX) / 2) * 1.15;
+      const dir = new THREE.Vector3(0.55, 0.62, 0.85).normalize();
+      return center.clone().addScaledVector(dir, dist);
+    })(), center);
+  }
+}
+toggleViewBtn.addEventListener("click", () => setShowOriginal(!showingOriginal));
+const toggleDimensionsBtn = document.getElementById("toggle-dimensions");
+toggleDimensionsBtn.addEventListener("click", () => {
+  dimensionsVisible = !dimensionsVisible;
+  dimensionGroup.visible = dimensionsVisible;
+  toggleDimensionsBtn.textContent = dimensionsVisible ? "Hide dimensions" : "Show dimensions";
+});
+document.getElementById("save-layout").addEventListener("click", saveLayout);
+
+function updatePointer(event) {
+  const rect = canvas.getBoundingClientRect();
+  pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+}
+function selectBedAtPointer(event) {
+  updatePointer(event);
+  raycaster.setFromCamera(pointer, camera);
+  const hit = raycaster.intersectObjects(bedMeshes, true)[0];
+  let bed = hit?.object ?? null;
+  while (bed && !bed.userData?.isBed) bed = bed.parent;
+  if (bed?.userData?.isBed) {
+    selectedBed = bed;
+    if (bedHelper) planGroup.remove(bedHelper);
+    bedHelper = new THREE.BoxHelper(selectedBed, 0xe05245);
+    planGroup.add(bedHelper);
+    status.textContent = `${selectedBed.userData.bedLabel} · 拖动调整位置`;
+    return true;
+  }
+  selectedBed = null;
+  if (bedHelper) { planGroup.remove(bedHelper); bedHelper = null; }
+  status.textContent = "点击并拖动床，可调整位置";
+  return false;
+}
+canvas.addEventListener("pointerdown", (event) => {
+  if (!selectBedAtPointer(event)) return;
+  draggingBed = true;
+  controls.enabled = false;
+  canvas.setPointerCapture(event.pointerId);
+});
+canvas.addEventListener("pointermove", (event) => {
+  if (!draggingBed || !selectedBed) return;
+  updatePointer(event);
+  raycaster.setFromCamera(pointer, camera);
+  if (raycaster.ray.intersectPlane(groundPlane, dragPoint)) {
+    const local = planGroup.worldToLocal(dragPoint.clone());
+    selectedBed.position.x = local.x;
+    selectedBed.position.z = local.z;
+    bedHelper?.update();
+  }
+});
+canvas.addEventListener("pointerup", (event) => {
+  if (!draggingBed) return;
+  draggingBed = false;
+  controls.enabled = true;
+  canvas.releasePointerCapture(event.pointerId);
+});
+
+// Live upload only works when the FastAPI server is reachable. Probe
+// /healthz once at startup; if it answers, reveal the upload UI and wire
+// drag-and-drop. On the static deploy this 404s and the upload UI stays
+// hidden — visitors still get the pre-rendered samples.
+async function enableLiveMode() {
+  // Cloudflare Pages serves index.html as a fallback for unknown paths,
+  // so a plain `res.ok` check would be true even with no backend. Require
+  // a real JSON body matching the FastAPI healthz contract.
+  try {
+    const res = await fetch("/healthz", { cache: "no-store" });
+    if (!res.ok) return;
+    if (!res.headers.get("content-type")?.includes("application/json")) return;
+    const body = await res.json();
+    if (!body || body.ok !== true) return;
+  } catch { return; }
+
+  document.getElementById("upload-label").hidden = false;
+  document.getElementById("upload-btn").hidden = false;
+
+  const fileInput = document.getElementById("file-input");
+  document.getElementById("upload-btn").addEventListener("click", () => fileInput.click());
+  fileInput.addEventListener("change", () => {
+    if (!fileInput.files.length) return;
+    const fd = new FormData();
+    fd.append("svg", fileInput.files[0]);
+    fetchAndLoad("/extract", { method: "POST", body: fd });
+    fileInput.value = "";
+  });
+
+  let dragDepth = 0;
+  window.addEventListener("dragenter", e => { e.preventDefault(); dragDepth++; document.body.classList.add("dragging"); });
+  window.addEventListener("dragleave", e => { e.preventDefault(); dragDepth--; if (dragDepth <= 0) document.body.classList.remove("dragging"); });
+  window.addEventListener("dragover",  e => { e.preventDefault(); });
+  window.addEventListener("drop", e => {
+    e.preventDefault(); dragDepth = 0; document.body.classList.remove("dragging");
+    const file = e.dataTransfer?.files?.[0];
+    if (!file) return;
+    const fd = new FormData();
+    fd.append("svg", file);
+    fetchAndLoad("/extract", { method: "POST", body: fd });
+  });
+}
+enableLiveMode();
+
+const INLINE_PLAN_DATA = {"canvas_size":[512,512],"content_rect":[105,0,301,512],"polygons":{"wall":[{"outer":[[247.0,372.0],[247.0,456.0],[234.0,457.0],[232.0,466.0],[268.0,466.0],[267.0,457.0],[255.0,456.0],[255.0,372.0]],"holes":[]},{"outer":[[132.0,271.0],[132.0,466.0],[156.0,466.0],[155.0,458.0],[142.0,458.0],[140.0,456.0],[140.0,300.0],[163.0,299.0],[163.0,294.0],[141.0,294.0],[140.0,272.0]],"holes":[]},{"outer":[[247.0,262.0],[248.0,275.0],[250.0,273.0],[248.0,265.0],[252.0,262.0],[273.0,262.0],[277.0,264.0],[276.0,272.0],[262.0,272.0],[265.0,274.0],[265.0,297.0],[262.0,299.0],[265.0,300.0],[265.0,305.0],[247.0,305.0],[247.0,340.0],[273.0,339.0],[272.0,334.0],[252.0,333.0],[252.0,311.0],[271.0,310.0],[269.0,306.0],[269.0,278.0],[310.0,277.0],[311.0,333.0],[293.0,334.0],[293.0,338.0],[310.0,339.0],[311.0,342.0],[343.0,341.0],[346.0,343.0],[346.0,456.0],[332.0,457.0],[332.0,466.0],[354.0,466.0],[354.0,335.0],[389.0,334.0],[389.0,264.0],[362.0,265.0],[362.0,273.0],[381.0,274.0],[380.0,327.0],[320.0,327.0],[319.0,274.0],[332.0,273.0],[332.0,264.0],[313.0,264.0],[312.0,257.0],[304.0,257.0],[303.0,262.0]],"holes":[[[277.0,264.0],[280.0,262.0],[302.0,262.0],[304.0,264.0],[304.0,271.0],[278.0,272.0]]]},{"outer":[[288.0,57.0],[288.0,64.0],[304.0,66.0],[304.0,153.0],[257.0,154.0],[257.0,158.0],[304.0,159.0],[304.0,201.0],[272.0,201.0],[271.0,209.0],[303.0,209.0],[304.0,226.0],[312.0,226.0],[312.0,57.0]],"holes":[]},{"outer":[[206.0,57.0],[206.0,64.0],[224.0,65.0],[225.0,152.0],[222.0,154.0],[222.0,158.0],[230.0,159.0],[231.0,154.0],[228.0,153.0],[228.0,66.0],[230.0,64.0],[244.0,64.0],[244.0,57.0]],"holes":[]},{"outer":[[132.0,57.0],[132.0,191.0],[186.0,190.0],[187.0,211.0],[187.0,197.0],[191.0,195.0],[196.0,196.0],[195.0,215.0],[141.0,215.0],[140.0,213.0],[132.0,213.0],[132.0,245.0],[140.0,245.0],[140.0,223.0],[150.0,221.0],[207.0,221.0],[208.0,240.0],[214.0,240.0],[214.0,216.0],[201.0,215.0],[201.0,191.0],[192.0,191.0],[191.0,183.0],[187.0,183.0],[186.0,187.0],[140.0,186.0],[141.0,159.0],[186.0,159.0],[187.0,163.0],[191.0,163.0],[194.0,154.0],[140.0,153.0],[140.0,66.0],[157.0,64.0],[156.0,57.0],[153.0,56.0]],"holes":[]}],"door":[{"outer":[[269.0,458.0],[269.0,465.0],[331.0,465.0],[331.0,458.0]],"holes":[]},{"outer":[[156.0,458.0],[156.0,465.0],[232.0,464.0],[232.0,458.0]],"holes":[]},{"outer":[[317.0,354.0],[326.0,358.0],[343.0,358.0],[343.0,353.0],[328.0,353.0],[326.0,350.0],[323.0,354.0]],"holes":[]},{"outer":[[247.0,341.0],[247.0,371.0],[250.0,372.0],[255.0,371.0],[253.0,356.0],[255.0,342.0]],"holes":[]},{"outer":[[274.0,337.0],[274.0,339.0],[293.0,339.0],[292.0,337.0]],"holes":[]},{"outer":[[272.0,308.0],[272.0,310.0],[292.0,310.0],[288.0,308.0]],"holes":[]},{"outer":[[164.0,294.0],[164.0,299.0],[208.0,299.0],[206.0,294.0]],"holes":[]},{"outer":[[134.0,245.0],[133.0,270.0],[139.0,270.0],[140.0,246.0]],"holes":[]},{"outer":[[208.0,241.0],[209.0,290.0],[213.0,291.0],[213.0,241.0]],"holes":[]},{"outer":[[276.0,223.0],[277.0,226.0],[301.0,226.0],[302.0,224.0]],"holes":[]},{"outer":[[133.0,192.0],[133.0,212.0],[140.0,212.0],[140.0,192.0]],"holes":[]},{"outer":[[202.0,191.0],[201.0,194.0],[210.0,195.0],[210.0,215.0],[213.0,215.0],[212.0,191.0]],"holes":[]},{"outer":[[245.0,57.0],[245.0,64.0],[287.0,64.0],[287.0,57.0]],"holes":[]},{"outer":[[157.0,57.0],[158.0,64.0],[205.0,64.0],[205.0,57.0]],"holes":[]},{"outer":[[259.0,33.0],[259.0,36.0],[268.0,38.0],[285.0,38.0],[301.0,35.0],[303.0,37.0],[303.0,56.0],[311.0,56.0],[311.0,33.0]],"holes":[]},{"outer":[[241.0,33.0],[227.0,33.0],[227.0,55.0],[231.0,53.0],[230.0,37.0],[232.0,35.0],[240.0,35.0]],"holes":[]}],"window":[{"outer":[[346.0,349.0],[343.0,347.0],[336.0,350.0],[310.0,350.0],[319.0,350.0],[320.0,352.0],[325.0,350.0],[329.0,352.0],[337.0,351.0],[344.0,354.0],[343.0,358.0],[310.0,359.0],[345.0,359.0]],"holes":[]}]}};
+status.textContent = summarize(INLINE_PLAN_DATA);
+loadPlan(INLINE_PLAN_DATA);
+</script>
+</body>
+</html>
