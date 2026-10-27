@@ -36,6 +36,12 @@
     padding: 18px 20px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 28px rgba(0,0,0,0.06);
   }
+  #ui.ui-hidden { display: none; }
+  #show-ui {
+    position: fixed; top: 18px; left: 18px; z-index: 11;
+    display: none;
+  }
+  #show-ui.visible { display: block; }
   h1 {
     margin: 0 0 14px;
     font-size: 13px; font-weight: 600;
@@ -115,6 +121,7 @@
   <button class="btn" id="toggle-view">Show original</button>
   <button class="btn" id="toggle-dimensions">Hide dimensions</button>
   <button class="btn" id="save-layout">保存布局</button>
+  <button class="btn" id="hide-ui">隐藏 UI</button>
   <div id="bed-help" style="font-size:11px;color:var(--muted);margin-top:10px">点击并拖动床，可调整位置</div>
 
   <div class="label" id="upload-label" hidden>Or upload</div>
@@ -123,6 +130,7 @@
 
   <div id="status">Ready.</div>
 </div>
+<button class="btn" id="show-ui">显示 UI</button>
 
 <canvas id="scene"></canvas>
 
@@ -786,6 +794,17 @@ toggleDimensionsBtn.addEventListener("click", () => {
   toggleDimensionsBtn.textContent = dimensionsVisible ? "Hide dimensions" : "Show dimensions";
 });
 document.getElementById("save-layout").addEventListener("click", saveLayout);
+const uiPanel = document.getElementById("ui");
+const hideUiBtn = document.getElementById("hide-ui");
+const showUiBtn = document.getElementById("show-ui");
+hideUiBtn.addEventListener("click", () => {
+  uiPanel.classList.add("ui-hidden");
+  showUiBtn.classList.add("visible");
+});
+showUiBtn.addEventListener("click", () => {
+  uiPanel.classList.remove("ui-hidden");
+  showUiBtn.classList.remove("visible");
+});
 
 function updatePointer(event) {
   const rect = canvas.getBoundingClientRect();
