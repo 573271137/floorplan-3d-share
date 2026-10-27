@@ -36,6 +36,36 @@
     padding: 18px 20px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 28px rgba(0,0,0,0.06);
   }
+  #ui.ui-hidden { display: none; }
+  #show-ui {
+    position: fixed; top: 18px; left: 18px; z-index: 11;
+    display: none;
+  }
+  #show-ui.visible { display: block; }
+  #object-hud {
+    position: fixed; top: 24px; right: 24px; z-index: 12;
+    display: none; gap: 6px; align-items: center;
+    padding: 10px; background: rgba(255,255,255,.84);
+    backdrop-filter: blur(16px); border: 1px solid var(--hairline);
+    border-radius: 12px; box-shadow: 0 8px 28px rgba(0,0,0,.08);
+  }
+  #object-hud.visible { display: flex; }
+  #object-hud-label { font-size: 11px; color: var(--muted); margin-right: 3px; }
+  /* Minimal layout: keep only the two requested controls visible. */
+  #ui h1, #ui .label, #ui [data-sample], #toggle-view,
+  #toggle-dimensions, #bed-help, #status, #upload-label, #upload-btn,
+  #file-input { display: none !important; }
+  #add-panel {
+    margin-top: 10px; padding-top: 10px;
+    border-top: 1px solid var(--hairline);
+  }
+  #add-panel[hidden] { display: none; }
+  #add-panel select, #add-panel input {
+    width: 78px; padding: 6px 7px; margin: 0 4px 6px 0;
+    border: 1px solid var(--hairline); border-radius: 7px;
+    background: #fff; color: var(--ink); font: inherit; font-size: 12px;
+  }
+  #add-panel select { width: 100%; }
   h1 {
     margin: 0 0 14px;
     font-size: 13px; font-weight: 600;
@@ -72,6 +102,16 @@
     margin-top: 14px;
     min-height: 14px;
     font-variant-numeric: tabular-nums;
+  }
+
+  #add-panel .dimension-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  #add-panel .dimension-field label {
+    font-size: 11px;
+    color: var(--muted);
   }
 
   /* Drop overlay — appears when dragging a file onto the page. */
@@ -114,14 +154,40 @@
   <div class="label">View</div>
   <button class="btn" id="toggle-view">Show original</button>
   <button class="btn" id="toggle-dimensions">Hide dimensions</button>
+  <button class="btn" id="add-furniture">增加</button>
   <button class="btn" id="save-layout">保存布局</button>
+  <button class="btn" id="hide-ui">隐藏 UI</button>
   <div id="bed-help" style="font-size:11px;color:var(--muted);margin-top:10px">点击并拖动床，可调整位置</div>
+  <div id="add-panel" hidden>
+    <select id="furniture-type" aria-label="家具类型">
+      <option value="sofa">沙发</option>
+      <option value="cabinet">柜子</option>
+      <option value="bed">床</option>
+    </select>
+    <div>
+      <div class="dimension-field">
+        <label for="furniture-length">长（米，沿物体长度方向）</label>
+        <input id="furniture-length" type="number" min="0.1" step="0.1" value="2.0" aria-label="长度（米）" placeholder="例如 2.0">
+      </div>
+      <div class="dimension-field">
+        <label for="furniture-width">宽（米，沿物体宽度方向）</label>
+        <input id="furniture-width" type="number" min="0.1" step="0.1" value="1.0" aria-label="宽度（米）" placeholder="例如 1.0">
+      </div>
+    </div>
+    <button class="btn primary" id="confirm-add">确认添加</button>
+  </div>
 
   <div class="label" id="upload-label" hidden>Or upload</div>
   <button class="btn primary" id="upload-btn" hidden>Choose SVG file…</button>
   <input type="file" id="file-input" accept=".svg" hidden>
 
   <div id="status">Ready.</div>
+</div>
+<button class="btn" id="show-ui">显示 UI</button>
+<div id="object-hud">
+  <span id="object-hud-label">已选中</span>
+  <button class="btn" id="rotate-object">顺时针旋转90°</button>
+  <button class="btn" id="delete-object">删除</button>
 </div>
 
 <canvas id="scene"></canvas>
@@ -216,9 +282,11 @@ const windowMat = new THREE.MeshPhysicalMaterial({
 });
 const edgeMat = new THREE.LineBasicMaterial({ color: COLOR_INK, transparent: true, opacity: 0.78 });
 const bedMeshes = [];
+const furnitureMeshes = [];
 let selectedBed = null;
+let selectedObject = null;
 let bedHelper = null;
-let draggingBed = false;
+let draggingObject = false;
 const pointer = new THREE.Vector2();
 const raycaster = new THREE.Raycaster();
 const groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
@@ -227,6 +295,9 @@ const bedFrameMat = new THREE.MeshStandardMaterial({ color: 0x9b6b45, roughness:
 const mattressMat = new THREE.MeshStandardMaterial({ color: 0xf3eee4, roughness: 0.95 });
 const pillowMat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.95 });
 const bedHitMat = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false });
+const sofaMat = new THREE.MeshStandardMaterial({ color: 0x6f8f8a, roughness: 0.9 });
+const cabinetMat = new THREE.MeshStandardMaterial({ color: 0x9a7653, roughness: 0.82 });
+const furnitureTopMat = new THREE.MeshStandardMaterial({ color: 0xe9dfd0, roughness: 0.92 });
 
 // Group containing the active plan; cleared on each load so we can reuse
 // the lights, camera, and floor across renders.
@@ -244,6 +315,7 @@ let dimensionsVisible = true;
 // to compute matching perspective and overhead camera positions.
 let currentFraming = null;
 let showingOriginal = false;
+const sceneMetrics = { scale: 1, cx: 0, cy: 0 };
 
 // -----------------------------------------------------------------------------
 // Resize
@@ -481,6 +553,7 @@ function clearPlan() {
   planGroup.add(dimensionGroup);
   animations.length = 0;
   bedMeshes.length = 0;
+  furnitureMeshes.length = 0;
   selectedBed = null;
   if (bedHelper) { planGroup.remove(bedHelper); bedHelper = null; }
 }
@@ -501,6 +574,27 @@ function makeDimensionLabel(text) {
   const sprite = new THREE.Sprite(mat);
   sprite.scale.set(0.72, 0.20, 1);
   sprite.renderOrder = 20;
+  sprite.userData.disposable = { texture: tex };
+  return sprite;
+}
+
+function makeObjectSizeLabel(lengthM, widthM) {
+  const canvas = document.createElement("canvas");
+  canvas.width = 360; canvas.height = 76;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "rgba(255,255,255,0.94)";
+  ctx.roundRect(2, 2, 356, 72, 12); ctx.fill();
+  ctx.strokeStyle = "#315f8c"; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillStyle = "#244b70"; ctx.font = "bold 28px system-ui";
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillText(`长 ${lengthM}m × 宽 ${widthM}m`, 180, 38);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.set(1.05, 0.22, 1);
+  sprite.position.y = 0.82;
+  sprite.renderOrder = 21;
   sprite.userData.disposable = { texture: tex };
   return sprite;
 }
@@ -581,6 +675,9 @@ function addBed(label, widthMm, lengthMm, imageX, imageY, rotationY, scale, cx, 
   g.add(hitArea);
   g.userData.bedLabel = `${label} ${widthMm / 1000}×${lengthMm / 1000}m`;
   g.userData.isBed = true;
+  g.userData.objectLengthM = lengthMm / 1000;
+  g.userData.objectWidthM = widthMm / 1000;
+  g.add(makeObjectSizeLabel(g.userData.objectLengthM, g.userData.objectWidthM));
   planGroup.add(g);
   bedMeshes.push(g);
 }
@@ -593,7 +690,62 @@ function addBeds(scale, cx, cy) {
   addBed("次卧", 1500, 2000, 181, 125, Math.PI, scale, cx, cy);
   addBed("次卧", 1200, 2000, 282, 125, Math.PI, scale, cx, cy);
   addBed("主卧", 1800, 2000, 330, 405, -Math.PI / 2, scale, cx, cy);
+  // Current user-approved arrangement, used when no browser-saved layout exists.
+  const defaultBedLayout = [
+    { x: -1.7611386320690348, z: 2.3671386239573984, rotationY: Math.PI },
+    { x: 0.45958486849639657, z: 2.39428014007797876, rotationY: Math.PI },
+    { x: 1.01375876910059047, z: -2.972255339592624, rotationY: -Math.PI / 2 },
+  ];
+  bedMeshes.forEach((bed, index) => {
+    const layout = defaultBedLayout[index];
+    if (!layout) return;
+    bed.position.x = layout.x;
+    bed.position.z = layout.z;
+    bed.rotation.y = layout.rotationY;
+  });
   restoreLayout();
+}
+
+function addFurniture(type, lengthM, widthM) {
+  const worldPerMeter = sceneMetrics.scale * (1000 / (5700 / 180));
+  const length = lengthM * worldPerMeter;
+  const width = widthM * worldPerMeter;
+  const g = new THREE.Group();
+  const existing = planGroup.children.filter(child => child.userData?.isFurniture).length;
+  const spread = Math.min(1.8, existing * 0.45);
+  g.position.set(-spread, 0.02, spread * 0.35);
+  g.userData.isFurniture = true;
+  g.userData.furnitureType = type;
+  g.userData.furnitureSize = `${lengthM}×${widthM}m`;
+  g.userData.objectLengthM = lengthM;
+  g.userData.objectWidthM = widthM;
+
+  if (type === "sofa") {
+    const seat = new THREE.Mesh(new THREE.BoxGeometry(width, 0.22, length), sofaMat);
+    seat.position.y = 0.13; seat.castShadow = true; seat.receiveShadow = true; g.add(seat);
+    const back = new THREE.Mesh(new THREE.BoxGeometry(width, 0.55, length * 0.16), sofaMat);
+    back.position.set(0, 0.48, -length * 0.42); back.castShadow = true; g.add(back);
+    for (const x of [-0.42, 0.42]) {
+      const arm = new THREE.Mesh(new THREE.BoxGeometry(width * 0.12, 0.42, length * 0.92), sofaMat);
+      arm.position.set(width * x, 0.32, 0); arm.castShadow = true; g.add(arm);
+    }
+  } else if (type === "cabinet") {
+    const body = new THREE.Mesh(new THREE.BoxGeometry(width, 0.85, length), cabinetMat);
+    body.position.y = 0.445; body.castShadow = true; body.receiveShadow = true; g.add(body);
+    const top = new THREE.Mesh(new THREE.BoxGeometry(width * 1.04, 0.06, length * 1.04), furnitureTopMat);
+    top.position.y = 0.9; top.castShadow = true; g.add(top);
+  } else {
+    const base = new THREE.Mesh(new THREE.BoxGeometry(width, 0.10, length), bedFrameMat);
+    base.position.y = 0.05; base.castShadow = true; g.add(base);
+    const mattress = new THREE.Mesh(new THREE.BoxGeometry(width * 0.94, 0.16, length * 0.93), mattressMat);
+    mattress.position.y = 0.18; mattress.castShadow = true; g.add(mattress);
+    const headboard = new THREE.Mesh(new THREE.BoxGeometry(width, 0.52, 0.07), bedFrameMat);
+    headboard.position.set(0, 0.30, -length * 0.47); headboard.castShadow = true; g.add(headboard);
+  }
+  g.add(makeObjectSizeLabel(lengthM, widthM));
+  planGroup.add(g);
+  furnitureMeshes.push(g);
+  status.textContent = `${type === "sofa" ? "沙发" : type === "cabinet" ? "柜子" : "床"} ${lengthM}×${widthM}m 已添加`;
 }
 
 function saveLayout() {
@@ -604,7 +756,32 @@ function saveLayout() {
     rotationY: bed.rotation.y,
   }));
   localStorage.setItem("floorplan-bed-layout-v1", JSON.stringify(layout));
+  localStorage.setItem("floorplan-furniture-layout-v1", JSON.stringify(furnitureMeshes.map((item) => ({
+    type: item.userData.furnitureType,
+    lengthM: Number(item.userData.furnitureSize.split("×")[0]),
+    widthM: Number(item.userData.furnitureSize.split("×")[1].replace("m", "")),
+    x: item.position.x,
+    z: item.position.z,
+    rotationY: item.rotation.y,
+  }))));
   status.textContent = "布局已保存到本机浏览器";
+}
+
+function restoreFurnitureLayout() {
+  try {
+    const saved = JSON.parse(localStorage.getItem("floorplan-furniture-layout-v1") || "[]");
+    if (!Array.isArray(saved)) return;
+    for (const item of saved) {
+      if (!item || !["sofa", "cabinet", "bed"].includes(item.type)) continue;
+      addFurniture(item.type, Number(item.lengthM), Number(item.widthM));
+      const furniture = furnitureMeshes[furnitureMeshes.length - 1];
+      if (Number.isFinite(item.x)) furniture.position.x = item.x;
+      if (Number.isFinite(item.z)) furniture.position.z = item.z;
+      if (Number.isFinite(item.rotationY)) furniture.rotation.y = item.rotationY;
+    }
+  } catch (e) {
+    console.warn("saved furniture layout ignored:", e);
+  }
 }
 
 function restoreLayout() {
@@ -640,8 +817,10 @@ async function loadPlan(data) {
   const cx = (bbox.minX + bbox.maxX) / 2;
   const cy = (bbox.minY + bbox.maxY) / 2;
   const scale = TARGET_PLAN_SIZE / Math.max(bw, bh);
+  sceneMetrics.scale = scale; sceneMetrics.cx = cx; sceneMetrics.cy = cy;
   addDimensions(bbox, scale, cx, cy);
   addBeds(scale, cx, cy);
+  restoreFurnitureLayout();
 
   // Frame the camera on the model's actual world bbox. After centering, the
   // model is at world (0, WALL_HEIGHT/2, 0), with horizontal extent bw*scale x
@@ -786,20 +965,83 @@ toggleDimensionsBtn.addEventListener("click", () => {
   toggleDimensionsBtn.textContent = dimensionsVisible ? "Hide dimensions" : "Show dimensions";
 });
 document.getElementById("save-layout").addEventListener("click", saveLayout);
+const addPanel = document.getElementById("add-panel");
+document.getElementById("add-furniture").addEventListener("click", () => {
+  addPanel.hidden = !addPanel.hidden;
+});
+document.getElementById("confirm-add").addEventListener("click", () => {
+  const type = document.getElementById("furniture-type").value;
+  const lengthM = Number(document.getElementById("furniture-length").value);
+  const widthM = Number(document.getElementById("furniture-width").value);
+  if (!Number.isFinite(lengthM) || !Number.isFinite(widthM) || lengthM <= 0 || widthM <= 0) {
+    status.textContent = "请输入有效的长和宽（单位：米）";
+    return;
+  }
+  addFurniture(type, lengthM, widthM);
+  addPanel.hidden = true;
+});
+const uiPanel = document.getElementById("ui");
+const hideUiBtn = document.getElementById("hide-ui");
+const showUiBtn = document.getElementById("show-ui");
+hideUiBtn.addEventListener("click", () => {
+  uiPanel.classList.add("ui-hidden");
+  showUiBtn.classList.add("visible");
+});
+showUiBtn.addEventListener("click", () => {
+  uiPanel.classList.remove("ui-hidden");
+  showUiBtn.classList.remove("visible");
+});
+
+const objectHud = document.getElementById("object-hud");
+const objectHudLabel = document.getElementById("object-hud-label");
+function hideObjectHud() {
+  objectHud.classList.remove("visible");
+  selectedObject = null;
+}
+function showObjectHud(object) {
+  selectedObject = object;
+  const label = object.userData.bedLabel ||
+    ({ sofa: "沙发", cabinet: "柜子", bed: "床" }[object.userData.furnitureType] || "物体");
+  objectHudLabel.textContent = `已选中：${label}`;
+  objectHud.classList.add("visible");
+}
+document.getElementById("rotate-object").addEventListener("click", () => {
+  if (!selectedObject) return;
+  selectedObject.rotation.y -= Math.PI / 2;
+});
+document.getElementById("delete-object").addEventListener("click", () => {
+  if (!selectedObject) return;
+  const object = selectedObject;
+  const bedIndex = bedMeshes.indexOf(object);
+  const furnitureIndex = furnitureMeshes.indexOf(object);
+  if (bedIndex >= 0) bedMeshes.splice(bedIndex, 1);
+  if (furnitureIndex >= 0) furnitureMeshes.splice(furnitureIndex, 1);
+  if (bedHelper && selectedBed === object) { planGroup.remove(bedHelper); bedHelper = null; }
+  if (selectedBed === object) selectedBed = null;
+  planGroup.remove(object);
+  disposeMeshDeep(object);
+  hideObjectHud();
+});
 
 function updatePointer(event) {
   const rect = canvas.getBoundingClientRect();
   pointer.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
 }
-function selectBedAtPointer(event) {
+function selectObjectAtPointer(event) {
   updatePointer(event);
   raycaster.setFromCamera(pointer, camera);
-  const hit = raycaster.intersectObjects(bedMeshes, true)[0];
-  let bed = hit?.object ?? null;
-  while (bed && !bed.userData?.isBed) bed = bed.parent;
-  if (bed?.userData?.isBed) {
-    selectedBed = bed;
+  const hit = raycaster.intersectObjects([...bedMeshes, ...furnitureMeshes], true)[0];
+  let object = hit?.object ?? null;
+  while (object && !object.userData?.isBed && !object.userData?.isFurniture) object = object.parent;
+  if (object?.userData?.isBed || object?.userData?.isFurniture) {
+    showObjectHud(object);
+    selectedBed = object.userData.isBed ? object : null;
+    if (!selectedBed && bedHelper) { planGroup.remove(bedHelper); bedHelper = null; }
+    if (!selectedBed) {
+      status.textContent = "拖动调整位置";
+      return true;
+    }
     if (bedHelper) planGroup.remove(bedHelper);
     bedHelper = new THREE.BoxHelper(selectedBed, 0xe05245);
     planGroup.add(bedHelper);
@@ -808,29 +1050,30 @@ function selectBedAtPointer(event) {
   }
   selectedBed = null;
   if (bedHelper) { planGroup.remove(bedHelper); bedHelper = null; }
+  hideObjectHud();
   status.textContent = "点击并拖动床，可调整位置";
   return false;
 }
 canvas.addEventListener("pointerdown", (event) => {
-  if (!selectBedAtPointer(event)) return;
-  draggingBed = true;
+  if (!selectObjectAtPointer(event)) return;
+  draggingObject = true;
   controls.enabled = false;
   canvas.setPointerCapture(event.pointerId);
 });
 canvas.addEventListener("pointermove", (event) => {
-  if (!draggingBed || !selectedBed) return;
+  if (!draggingObject || !selectedObject) return;
   updatePointer(event);
   raycaster.setFromCamera(pointer, camera);
   if (raycaster.ray.intersectPlane(groundPlane, dragPoint)) {
     const local = planGroup.worldToLocal(dragPoint.clone());
-    selectedBed.position.x = local.x;
-    selectedBed.position.z = local.z;
+    selectedObject.position.x = local.x;
+    selectedObject.position.z = local.z;
     bedHelper?.update();
   }
 });
 canvas.addEventListener("pointerup", (event) => {
-  if (!draggingBed) return;
-  draggingBed = false;
+  if (!draggingObject) return;
+  draggingObject = false;
   controls.enabled = true;
   canvas.releasePointerCapture(event.pointerId);
 });
